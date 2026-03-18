@@ -27,19 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
-  imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
-
 }
-
-interface ImageContentBlock {
-  type: 'image';
-  source: { type: 'base64'; media_type: string; data: string };
-}
-interface TextContentBlock {
-  type: 'text';
-  text: string;
-}
-type ContentBlock = ImageContentBlock | TextContentBlock;
 
 interface ContainerOutput {
   status: 'success' | 'error';
@@ -61,12 +49,17 @@ interface SessionsIndex {
 
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string | ContentBlock[] };
+  message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+const WORKSPACE_GROUP = process.env.NANOCLAW_WORKSPACE_GROUP || '/workspace/group';
+const WORKSPACE_IPC = process.env.NANOCLAW_WORKSPACE_IPC || '/workspace/ipc';
+const WORKSPACE_GLOBAL = process.env.NANOCLAW_WORKSPACE_GLOBAL || '/workspace/global';
+const WORKSPACE_EXTRA = process.env.NANOCLAW_WORKSPACE_EXTRA || '/workspace/extra';
+
+const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
@@ -83,16 +76,6 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  pushMultimodal(content: ContentBlock[]): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -187,7 +170,7 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
 
-      const conversationsDir = '/workspace/group/conversations';
+      const conversationsDir = path.join(WORKSPACE_GROUP, 'conversations');
       fs.mkdirSync(conversationsDir, { recursive: true });
 
       const date = new Date().toISOString().split('T')[0];
@@ -362,23 +345,6 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
-  // Load image attachments and send as multimodal content blocks
-  if (containerInput.imageAttachments?.length) {
-    const blocks: ContentBlock[] = [];
-    for (const img of containerInput.imageAttachments) {
-      const imgPath = path.join('/workspace/group', img.relativePath);
-      try {
-        const data = fs.readFileSync(imgPath).toString('base64');
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data } });
-      } catch (err) {
-        log(`Failed to load image: ${imgPath}`);
-      }
-    }
-    if (blocks.length > 0) {
-      stream.pushMultimodal(blocks);
-    }
-  }
-
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
@@ -406,19 +372,18 @@ async function runQuery(
   let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
+  // Discover additional directories mounted at extra workspace
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
+  if (fs.existsSync(WORKSPACE_EXTRA)) {
+    for (const entry of fs.readdirSync(WORKSPACE_EXTRA)) {
+      const fullPath = path.join(WORKSPACE_EXTRA, entry);
       if (fs.statSync(fullPath).isDirectory()) {
         extraDirs.push(fullPath);
       }
@@ -431,7 +396,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      cwd: '/workspace/group',
+      cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,

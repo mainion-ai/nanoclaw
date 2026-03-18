@@ -1,11 +1,13 @@
 /**
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
+ * In native mode, these are no-ops.
  */
 import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 
+import { NATIVE_MODE } from './config.js';
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
@@ -64,6 +66,11 @@ export function stopContainer(name: string): string {
 
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
+  if (NATIVE_MODE) {
+    logger.info('Native mode enabled, skipping container runtime check');
+    return;
+  }
+
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
       stdio: 'pipe',
@@ -94,6 +101,9 @@ export function ensureContainerRuntimeRunning(): void {
       '║  3. Restart NanoClaw                                           ║',
     );
     console.error(
+      '║  Or set NATIVE_MODE=1 in .env to run without containers.      ║',
+    );
+    console.error(
       '╚════════════════════════════════════════════════════════════════╝\n',
     );
     throw new Error('Container runtime is required but failed to start');
@@ -102,6 +112,8 @@ export function ensureContainerRuntimeRunning(): void {
 
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
+  if (NATIVE_MODE) return;
+
   try {
     const output = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
