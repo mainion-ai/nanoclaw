@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash:*)",
+      "Bash(npx tsx:*)",
+      "Bash(curl:*)",
+      "Bash(sudo usermod:*)",
+      "Bash(sudo systemctl:*)",
+      "Bash(sudo:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)",
+      "Bash(claude:*)",
+      "Bash(npm test:*)",
+      "Bash(systemctl:*)",
+      "Bash(journalctl:*)",
+      "Bash(sqlite3:*)",
+      "Bash(node:*)",
+      "Bash(echo CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN:*)",
+      "Read(//home/np/.claude/**)",
+      "Bash(git fetch:*)",
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "Bash(git:*)",
+      "Bash(npx vitest:*)",
+      "Bash(./container/build.sh 2>&1 | tail -20)",
+      "Bash(ls:*)",
+      "Bash(for dir:*)"
+    ]
+  }
+}
