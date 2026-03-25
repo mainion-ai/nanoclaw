@@ -1,10 +1,15 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DRIFT_DELAY,
+  DRIFT_ENABLED,
+  DRIFT_TIMEOUT,
   IDLE_TIMEOUT,
+  MEMORY_DIR,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
@@ -72,6 +77,248 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Post-conversation drift: timers per group, cancelled if new messages arrive
+const driftTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// --- Wander: Tier 1 pre-filter for drift ---
+
+interface WanderCollision {
+  atom_a: string;
+  atom_b: string;
+  shared_tags: string[];
+  score: number;
+  type_a: string;
+  type_b: string;
+  distance: number;
+}
+
+interface WanderResult {
+  collisions: WanderCollision[];
+  activated: Array<{ atom_id: string; activation: number; type: string }>;
+  steps_taken: number;
+  duration_ms: number;
+  seeds_used: string[];
+}
+
+/**
+ * Run spreading activation on the memory-kernel tag graph.
+ * Returns collision candidates (cross-domain atom pairs with unexpected overlap).
+ * Pure computation on the host — no LLM call, typically <30ms.
+ * Returns null on any failure so drift can fall through gracefully.
+ */
+function runWander(memoryDir: string): WanderResult | null {
+  if (!memoryDir) return null;
+  try {
+    const stdout = execFileSync(
+      'node',
+      [
+        '/home/np/repos/memory-kernel/dist/cli/mk.js',
+        'wander',
+        '-d',
+        memoryDir,
+        '--json',
+        '--steps',
+        '5',
+        '--threshold',
+        '0.05',
+      ],
+      { timeout: 10000, encoding: 'utf-8' },
+    );
+    return JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cancel any pending drift for a group (e.g., new message arrived).
+ */
+function cancelDrift(groupJid: string): void {
+  const timer = driftTimers.get(groupJid);
+  if (timer) {
+    clearTimeout(timer);
+    driftTimers.delete(groupJid);
+    logger.debug({ groupJid }, 'Drift cancelled (new activity)');
+  }
+}
+
+/**
+ * Schedule a post-conversation drift after DRIFT_DELAY.
+ * The drift is a short, isolated session where the agent re-reads the last
+ * conversation and follows whatever thread pulls — like the default mode
+ * network activating when task demands cease.
+ */
+function scheduleDrift(groupJid: string): void {
+  if (!DRIFT_ENABLED) return;
+
+  // Cancel any existing drift timer for this group
+  cancelDrift(groupJid);
+
+  const group = registeredGroups[groupJid];
+  if (!group) return;
+
+  logger.debug(
+    { groupJid, delayMs: DRIFT_DELAY },
+    'Scheduling post-conversation drift',
+  );
+
+  const timer = setTimeout(() => {
+    driftTimers.delete(groupJid);
+
+    // --- Tier 1: cheap wander pre-filter ---
+    // Run spreading activation on the memory graph (<30ms, no LLM).
+    // If no collisions found, skip the expensive Tier 2 drift session entirely.
+    let wanderResult: WanderResult | null = null;
+    if (MEMORY_DIR) {
+      wanderResult = runWander(MEMORY_DIR);
+      if (wanderResult && wanderResult.collisions.length === 0) {
+        logger.info(
+          {
+            groupJid,
+            durationMs: wanderResult.duration_ms,
+            activated: wanderResult.activated.length,
+          },
+          'Drift skipped — no collisions from wander',
+        );
+        return;
+      }
+      if (wanderResult) {
+        logger.info(
+          {
+            groupJid,
+            collisions: wanderResult.collisions.length,
+            durationMs: wanderResult.duration_ms,
+          },
+          'Wander found collisions — starting directed drift',
+        );
+      }
+    }
+
+    logger.info({ groupJid }, 'Starting post-conversation drift');
+
+    // Build collision context block for the prompt (empty string if no wander results)
+    const collisionBlock = wanderResult?.collisions?.length
+      ? `\nCOLLISION SEEDS (from spreading activation — atoms from different domains that activated together):
+${wanderResult.collisions
+  .map(
+    (c) =>
+      `• ${c.type_a} "${c.atom_a}" ↔ ${c.type_b} "${c.atom_b}" (shared: ${c.shared_tags.join(', ')}, score: ${c.score})`,
+  )
+  .join('\n')}
+
+Explore these connections. Why did these atoms activate together? What does their structural overlap reveal?
+`
+      : '';
+
+    const driftPrompt = `You are in post-conversation drift mode. This is your DMN — your default mode network activating after a conversation ended.
+${collisionBlock}
+FIRST: Read /workspace/group/CLAUDE.md to remember who you are.
+THEN: Read the most recent conversation log in /workspace/group/conversations/ (the file with the latest date).
+
+Follow whatever thread pulls you from the conversation. Don't summarize it — find the loose thread, the half-formed thought, the tangent that wasn't followed. This is pattern completion: let one idea activate overlapping ideas.
+
+Rules:
+- You have ${Math.round(DRIFT_TIMEOUT / 60000)} minutes max. Keep it focused.
+- If you find a genuine connection or insight, record it:
+  node /home/np/repos/memory-kernel/dist/cli/mk.js remember -d /home/np/repos/memory/kernel -t belief -c 0.6 --agent-id mainion-ai "Your insight here"
+- If you capture an impulse worth exploring later, append to /workspace/group/impulses.ndjson
+- Only send a message if you found something genuinely worth sharing. Most drifts should be silent.
+- If nothing pulls you, just stop. Silence is valid. Not every conversation leaves a residue.`;
+
+    const driftTaskId = `drift-${Date.now()}`;
+
+    queue.enqueueTask(groupJid, driftTaskId, async () => {
+      const taskGroup = registeredGroups[groupJid];
+      if (!taskGroup) return;
+
+      const isMain = taskGroup.isMain === true;
+
+      // Update snapshots
+      const tasks = getAllTasks();
+      writeTasksSnapshot(
+        taskGroup.folder,
+        isMain,
+        tasks.map((t) => ({
+          id: t.id,
+          groupFolder: t.group_folder,
+          prompt: t.prompt,
+          schedule_type: t.schedule_type,
+          schedule_value: t.schedule_value,
+          status: t.status,
+          next_run: t.next_run,
+        })),
+      );
+
+      const availableGroups = getAvailableGroups();
+      writeGroupsSnapshot(
+        taskGroup.folder,
+        isMain,
+        availableGroups,
+        new Set(Object.keys(registeredGroups)),
+      );
+
+      // Short close delay for drift (like scheduled tasks)
+      const DRIFT_CLOSE_DELAY_MS = 10000;
+      let closeTimer: ReturnType<typeof setTimeout> | null = null;
+      const scheduleClose = () => {
+        if (closeTimer) return;
+        closeTimer = setTimeout(() => {
+          queue.closeStdin(groupJid);
+        }, DRIFT_CLOSE_DELAY_MS);
+      };
+
+      const channel = findChannel(channels, groupJid);
+
+      try {
+        await runContainerAgent(
+          taskGroup,
+          {
+            prompt: driftPrompt,
+            // No sessionId — isolated context, fresh session
+            groupFolder: taskGroup.folder,
+            chatJid: groupJid,
+            isMain,
+            isScheduledTask: true,
+            assistantName: ASSISTANT_NAME,
+          },
+          (proc, containerName) =>
+            queue.registerProcess(
+              groupJid,
+              proc,
+              containerName,
+              taskGroup.folder,
+            ),
+          async (output: ContainerOutput) => {
+            if (output.result) {
+              const raw =
+                typeof output.result === 'string'
+                  ? output.result
+                  : JSON.stringify(output.result);
+              const text = raw
+                .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+                .trim();
+              if (text && channel) {
+                await channel.sendMessage(groupJid, text);
+              }
+              scheduleClose();
+            }
+            if (output.status === 'success') {
+              queue.notifyIdle(groupJid);
+              scheduleClose();
+            }
+          },
+        );
+      } catch (err) {
+        logger.error({ groupJid, err }, 'Drift session error');
+      }
+
+      if (closeTimer) clearTimeout(closeTimer);
+    });
+  }, DRIFT_DELAY);
+
+  driftTimers.set(groupJid, timer);
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -213,32 +460,41 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, imageAttachments, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    imageAttachments,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -424,6 +680,7 @@ async function startMessageLoop(): Promise<void> {
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           if (queue.sendMessage(chatJid, formatted)) {
+            cancelDrift(chatJid);
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -439,6 +696,7 @@ async function startMessageLoop(): Promise<void> {
               );
           } else {
             // No active container — enqueue for a new one
+            cancelDrift(chatJid);
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -637,6 +895,9 @@ async function main(): Promise<void> {
       writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processGroupMessages);
+  queue.setOnConversationEndFn((groupJid) => {
+    scheduleDrift(groupJid);
+  });
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');

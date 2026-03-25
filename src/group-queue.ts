@@ -33,6 +33,7 @@ export class GroupQueue {
   private waitingGroups: string[] = [];
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
+  private onConversationEndFn: ((groupJid: string) => void) | null = null;
   private shuttingDown = false;
 
   private getGroup(groupJid: string): GroupState {
@@ -57,6 +58,10 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  setOnConversationEndFn(fn: (groupJid: string) => void): void {
+    this.onConversationEndFn = fn;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -227,6 +232,24 @@ export class GroupQueue {
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
+
+      // Notify that a conversation (not a task) just ended —
+      // used by drift feature to schedule post-conversation exploration
+      if (
+        this.onConversationEndFn &&
+        !state.pendingMessages &&
+        state.pendingTasks.length === 0
+      ) {
+        try {
+          this.onConversationEndFn(groupJid);
+        } catch (err) {
+          logger.error(
+            { groupJid, err },
+            'Error in onConversationEnd callback',
+          );
+        }
+      }
+
       this.drainGroup(groupJid);
     }
   }

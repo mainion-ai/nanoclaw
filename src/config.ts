@@ -73,6 +73,17 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// Post-conversation drift: agent explores freely after conversations end
+export const DRIFT_ENABLED = (process.env.DRIFT_ENABLED || 'true') === 'true';
+export const DRIFT_DELAY = parseInt(process.env.DRIFT_DELAY || '120000', 10); // 2 min after conversation ends before drift starts
+export const DRIFT_TIMEOUT = parseInt(
+  process.env.DRIFT_TIMEOUT || '600000',
+  10,
+); // 10 min max for drift sessions
+
+// Memory-kernel directory for wander pre-filter (Tier 1 gate before drift)
+export const MEMORY_DIR = process.env.MEMORY_DIR || '';
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =
