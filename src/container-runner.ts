@@ -14,6 +14,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  NATIVE_MODE,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -42,7 +43,6 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
-
 }
 
 export interface ContainerOutput {
@@ -272,6 +272,11 @@ export async function runContainerAgent(
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  if (NATIVE_MODE) {
+    const { runNativeAgent } = await import('./native-runner.js');
+    return runNativeAgent(group, input, onProcess, onOutput);
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
