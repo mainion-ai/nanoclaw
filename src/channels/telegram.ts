@@ -14,6 +14,77 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
+const GROQ_API_KEY =
+  process.env.GROQ_API_KEY || readEnvFile(['GROQ_API_KEY']).GROQ_API_KEY || '';
+
+async function transcribeVoice(
+  buffer: Buffer,
+  filename: string,
+): Promise<string | null> {
+  if (!GROQ_API_KEY) {
+    logger.warn('GROQ_API_KEY not set — voice transcription disabled');
+    return null;
+  }
+
+  try {
+    // Build multipart form data manually
+    const boundary = `----FormBoundary${Date.now()}`;
+    const filePart = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+      'Content-Type: audio/ogg',
+      '',
+    ].join('\r\n');
+    const modelPart = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="model"',
+      '',
+      'whisper-large-v3-turbo',
+    ].join('\r\n');
+    const closing = `\r\n--${boundary}--\r\n`;
+
+    const parts = Buffer.concat([
+      Buffer.from(filePart + '\r\n'),
+      buffer,
+      Buffer.from('\r\n' + modelPart + closing),
+    ]);
+
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/audio/transcriptions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        },
+        body: parts,
+      },
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error(
+        { status: response.status, body: errorText },
+        'Groq transcription failed',
+      );
+      return null;
+    }
+
+    const result = (await response.json()) as { text?: string };
+    const transcript = result.text?.trim();
+    if (!transcript) return null;
+
+    logger.info(
+      { length: transcript.length },
+      'Voice message transcribed via Groq',
+    );
+    return transcript;
+  } catch (err) {
+    logger.error({ err }, 'Voice transcription error');
+    return null;
+  }
+}
+
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -229,7 +300,68 @@ export class TelegramChannel implements Channel {
       storeNonText(ctx, '[Photo]');
     });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      try {
+        const voice = ctx.message.voice;
+        const file = await ctx.api.getFile(voice.file_id);
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+
+        const response = await fetch(fileUrl);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        const transcript = await transcribeVoice(buffer, 'voice.ogg');
+        if (transcript) {
+          const timestamp = new Date(ctx.message.date * 1000).toISOString();
+          const senderName =
+            ctx.from?.first_name ||
+            ctx.from?.username ||
+            ctx.from?.id?.toString() ||
+            'Unknown';
+
+          const isGroup =
+            ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+          this.opts.onChatMetadata(
+            chatJid,
+            timestamp,
+            undefined,
+            'telegram',
+            isGroup,
+          );
+
+          // Prepend trigger so the agent processes voice like a direct message
+          let content = `[Voice message]: ${transcript}`;
+          if (TRIGGER_PATTERN && !TRIGGER_PATTERN.test(content)) {
+            content = `@${ASSISTANT_NAME} ${content}`;
+          }
+
+          this.opts.onMessage(chatJid, {
+            id: ctx.message.message_id.toString(),
+            chat_jid: chatJid,
+            sender: ctx.from?.id?.toString() || '',
+            sender_name: senderName,
+            content,
+            timestamp,
+            is_from_me: false,
+          });
+
+          logger.info(
+            { chatJid, transcriptLength: transcript.length },
+            'Voice message transcribed and delivered',
+          );
+          return;
+        }
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Voice transcription failed');
+      }
+
+      // Fallback to placeholder if transcription fails
+      storeNonText(ctx, '[Voice message]');
+    });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
